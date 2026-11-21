@@ -117,7 +117,7 @@ cross-check of the built-in inflate against the browser's reference
 `CompressionStream` / `DecompressionStream`. You can also pick a real `.trc`
 file in that page to see the parsed events.
 
-Reference values for the GOLD sample `9076.trc` (matches the analyzer GOLD;
+Reference values for the GOLD sample `sample.trc` (matches the analyzer GOLD;
 the sample file itself is **not** included in this repository):
 
 | Parameter | 1310 nm | 1550 nm |
