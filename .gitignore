@@ -1,0 +1,16 @@
+# Measurement data: reflectograms contain real link data (dates, module
+# serial numbers, fiber lengths) - never publish them by accident
+*.trc
+
+# Local analysis / test artifacts
+*.csv
+*.nodetree.json
+otdr_config.txt
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.vs/
+.vscode/
+.idea/

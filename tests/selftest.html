@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<!--
+  ============================================================================
+  tests/selftest.html — тесты парсера otdr-parser.js без внешних данных.
+  Открывается двойным кликом (работает с file://).
+
+  1. Синтетический .trc: собирается мини-файл формата (zlib-чанки со stored
+     блоками + дерево узлов + RawSamples + EventTable), парсится и сверяется
+     с ожидаемыми значениями (GOLD синтетики).
+  2. inflate round-trip: decompressChunks восстанавливает точную длину и
+     содержимое packed-потока.
+  3. NaN-политика EXFO: Loss=NaN должен читаться как «значения нет» (null).
+  4. Реальный файл (по желанию): выберите .trc — тесты GOLD для эталонного
+     9076.trc: QC-событие ≈ 1010.9 м, конец ≈ 8349.3 м, 2 длины волны.
+  ============================================================================
+-->
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>TrcViewer — selftest</title>
+<style>
+  body { font: 14px/1.5 "Segoe UI", system-ui, sans-serif; margin: 24px; color: #1c2733; }
+  h1 { font-size: 20px; } h2 { font-size: 15px; margin-top: 24px; }
+  .ok { color: #0a7d33; font-weight: 600; } .fail { color: #b02a37; font-weight: 600; }
+  pre { background: #f4f6f8; border: 1px solid #d7dee6; border-radius: 8px; padding: 10px; }
+  #summary { font-size: 18px; margin-top: 20px; }
+</style>
+</head>
+<body>
+<h1>TrcViewer parser selftest</h1>
+<input type="file" id="real" accept=".trc">
+<pre id="realOut"></pre>
+<div id="tests"></div>
+<div id="summary"></div>
+
+<script src="../otdr-parser.js"></script>
+<script>
+'use strict';
+(function () {
+  let pass = 0, fail = 0;
+  const out = document.getElementById('tests');
+  function T(name, cond, detail) {
+    if (cond) pass++; else fail++;
+    const d = document.createElement('div');
+    d.className = cond ? 'ok' : 'fail';
+    d.textContent = (cond ? 'PASS  ' : 'FAIL  ') + name + (detail ? '  — ' + detail : '');
+    out.appendChild(d);
+  }
+  function near(a, b, eps) { return a !== null && Math.abs(a - b) <= eps; }
+
+  // ---------------- синтетический .trc ----------------
+  const buf = [];
+  const u32 = n => [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255];
+  function cstr(s) { return [...new TextEncoder().encode(s), 0]; }
+  function name(s) { const off = buf.length; buf.push(...cstr(s)); return off; }
+  function f64(v) { const ab = new ArrayBuffer(8); new DataView(ab).setFloat64(0, v, true); return [...new Uint8Array(ab)]; }
+  function u16str(s) { const a = [...new TextEncoder().encode(s + '\0')]; const b = []; for (const c of a) { b.push(c, 0); } return b; }
+  function node(nameOff, type, valBytes) {
+    const off = buf.length;
+    buf.push(...u32(nameOff), ...u32(type), ...u32(valBytes.length), ...u32(off + 16), ...valBytes);
+    return off;
+  }
+  const container = (nameOff, childOffsets) => node(nameOff, 0, childOffsets.flatMap(u32));
+
+  // имена (порядок произволен — offsets абсолютны)
+  const N = {};
+  for (const s of ['OtdrFile', 'OtdrData', 'Fibers', 'Count', 'Fiber0', 'FiberCode', 'Identifier',
+    'Traces', 'Trace0', 'Wavelength', 'ScaleFactor', 'Range', 'SamplingPeriod', 'RangeStart', 'RangeEnd',
+    'InjectionLevel', 'SpansLength', 'SpansLoss', 'TotalOrl', 'RmsNoise', 'Date', 'RawSamples',
+    'EventTable', 'Event0', 'Event1', 'Event2', 'Event3', 'Event4', 'Type', 'Status', 'Position',
+    'Length', 'Loss', 'Reflectance', 'CurveLevel', 'ModuleInformation', 'ModelName', 'SerialNumber'])
+    N[s] = name(s);
+
+  // параметры сетки — как в эталонных файлах
+  const periodS = 3.125e-9, rangeM = 20000, rStart = 1.225e-9, rEnd = 1.95882e-4;
+  const stepM = periodS * rangeM / (rEnd - rStart); // ≈ 0.3191 м
+  const NSAMP = 2000, attenPerM = 0.00035;          // 0.35 dB/km
+
+  // scalars кривой
+  const sWave = node(N['Wavelength'], 3, f64(1.31e-6));
+  const sScale = node(N['ScaleFactor'], 3, f64(1024));
+  const sRange = node(N['Range'], 3, f64(rangeM));
+  const sPeriod = node(N['SamplingPeriod'], 3, f64(periodS));
+  const sRStart = node(N['RangeStart'], 3, f64(rStart));
+  const sREnd = node(N['RangeEnd'], 3, f64(rEnd));
+  const sInj = node(N['InjectionLevel'], 3, f64(20.5));
+  const sSpanL = node(N['SpansLength'], 3, f64((NSAMP - 1) * stepM));
+  const sSpanLoss = node(N['SpansLoss'], 3, f64((NSAMP - 1) * stepM * attenPerM));
+  const sOrl = node(N['TotalOrl'], 3, f64(30.1));
+  const sNoise = node(N['RmsNoise'], 3, f64(7.0));
+  const sDate = node(N['Date'], 4, u16str('2024-01-01T00:00:00'));
+
+  // RawSamples: синтетический спад с двумя отражательными пиками
+  const samples = new Int16Array(NSAMP);
+  const qcI = Math.round(320 / stepM), endI = NSAMP - 3;
+  for (let i = 0; i < NSAMP; i++) {
+    let db = 25 - i * stepM * attenPerM;
+    if (i === qcI) db = 28.5;       // пик QC-коннектора
+    if (i === endI) db = 27.0;      // пик конца волокна
+    samples[i] = Math.round(db * 1024);
+  }
+  const rawBytes = []; for (const s of samples) rawBytes.push(s & 255, (s >> 8) & 255);
+  const sRaw = node(N['RawSamples'], 2, rawBytes);
+
+  // события EventTable: 3 point + 2 LMA (чередование, как в FORMAT.md §7)
+  function pointEvent(nameOff, status, pos, loss, refl) {
+    const children = [
+      node(N['Type'], 1, u32(3)),
+      node(N['Status'], 1, u32(status)),
+      node(N['Position'], 3, f64(pos)),
+      node(N['Length'], 3, f64(15)),
+      node(N['Loss'], 3, f64(loss)),          // NaN допустим
+      node(N['Reflectance'], 3, f64(refl)),
+      node(N['CurveLevel'], 3, f64(20)),
+    ];
+    return container(nameOff, children);
+  }
+  function lmaEvent(nameOff, pos, len, loss) {
+    const children = [
+      node(N['Position'], 3, f64(pos)),
+      node(N['Length'], 3, f64(len)),
+      node(N['Loss'], 3, f64(loss)),
+    ];
+    return container(nameOff, children);
+  }
+  const ev0 = pointEvent(N['Event0'], 72, 0, NaN, -44);                 // порт (Loss=NaN)
+  const ev1 = lmaEvent(N['Event1'], 0, 320, 320 * attenPerM);           // секция
+  const ev2 = pointEvent(N['Event2'], 0, 320, 0.42, -43);               // QC-подобное
+  const ev3 = lmaEvent(N['Event3'], 320, (NSAMP - 3 - 320) * stepM, (NSAMP - 3 - 320) * stepM * attenPerM);
+  const ev4 = pointEvent(N['Event4'], 132, (NSAMP - 3) * stepM, NaN, -50); // конец
+  const evTab = container(N['EventTable'], [ev0, ev1, ev2, ev3, ev4]);
+
+  const modInfo = container(N['ModuleInformation'], [
+    node(N['ModelName'], 4, u16str('FTB-TEST-1')),
+    node(N['SerialNumber'], 4, u16str('SN-001')),
+  ]);
+  const trace0 = container(N['Trace0'], [sWave, sScale, sRange, sPeriod, sRStart, sREnd,
+    sInj, sSpanL, sSpanLoss, sOrl, sNoise, sDate, sRaw, evTab, modInfo]);
+  const traces = container(N['Traces'], [trace0]);
+  const fiber0 = container(N['Fiber0'], [node(N['FiberCode'], 1, u32(7)), node(N['Identifier'], 4, u16str('FIBER-A')), traces]);
+  const fibers = container(N['Fibers'], [fiber0]);
+  const otdrData = container(N['OtdrData'], [fibers]);
+  const root = container(N['OtdrFile'], [otdrData]);
+  const merged = Uint8Array.from(buf);
+
+  // упаковка: служебный мусор + короткий чанк (как #01) + основной чанк (stored)
+  function zlibStored(data) {
+    const out = [0x78, 0x01, 0x01];
+    const l = data.length;
+    out.push(l & 255, (l >>> 8) & 255, (~l) & 255, ((~l) >>> 8) & 255);
+    out.push(...data);
+    const ad = adler32(data);
+    out.push((ad >>> 24) & 255, (ad >>> 16) & 255, (ad >>> 8) & 255, ad & 255);
+    return out;
+  }
+  const tiny = new Uint8Array([0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+  const file = Uint8Array.from([
+    ...new TextEncoder().encode('AppReg Format Ex  \0\0'), ...u32(2), ...u32(tiny.length), ...u32(1), ...u32(0), ...u32(30),
+    ...zlibStored(tiny),
+    ...new TextEncoder().encode('AppReg Format Ex  \0\0'), ...u32(2), ...u32(merged.length), ...u32(1), ...u32(0), ...u32(30),
+    ...zlibStored(merged),
+  ]);
+
+  // ---------------- тесты ----------------
+  // 1. inflate round-trip
+  try {
+    const back = decompressChunks(file);
+    T('inflate: длина packed-потока', back.length === merged.length, `${back.length} vs ${merged.length}`);
+    let same = back.length === merged.length;
+    for (let i = 0; same && i < merged.length; i++) if (back[i] !== merged[i]) same = false;
+    T('inflate: побайтовое совпадение', same);
+  } catch (e) { T('inflate round-trip', false, e.message); }
+
+  // 2. разбор синтетического файла
+  let fib = null;
+  try { fib = parseTrcFile(file.buffer); } catch (e) { T('parseTrcFile не бросает исключение', false, e.message); }
+  T('1 волокно', fib && fib.length === 1);
+  const tr = fib && fib[0].traces[0];
+  T('1 трасса Trace0', !!tr && tr.name === 'Trace0');
+  T('длина волны 1310 нм', tr && tr.wavelengthNm === 1310, tr && String(tr.wavelengthNm));
+  T('2000 отсчётов', tr && tr.samples.length === 2000, tr && String(tr.samples.length));
+  T('ScaleFactor=1024', tr && tr.countsPerDb === 1024);
+  T('шаг сетки ≈ 0.319 м', tr && near(traceStepM(tr), 0.31907, 1e-4), tr && traceStepM(tr).toFixed(5));
+  // dist_i = (RangeStart + i*Period) * Range/(RangeEnd-RangeStart) — с offset'ом RangeStart
+  const maxDistExpected = (rStart + (NSAMP - 1) * periodS) * rangeM / (rEnd - rStart);
+  T('макс. дистанция формулой с RangeStart', tr && near(traceMaxDist(tr), maxDistExpected, 1e-9), tr && traceMaxDist(tr).toFixed(6));
+  T('уровень 0-го отсчёта = 25.000 дБ', tr && near(traceLevelDb(tr, 0), 25, 0.001));
+  T('затухание кривой 0.35 дБ/км', tr &&
+      Math.abs((traceLevelDb(tr, 0) - traceLevelDb(tr, 1500)) / (1500 * stepM / 1000) - 0.35) < 0.01);
+  T('meta: InjectionLevel', tr && near(tr.meta.injection, 20.5, 1e-9));
+  T('meta: Date', tr && tr.meta.date === '2024-01-01T00:00:00', tr && tr.meta.date);
+  T('meta: модуль', tr && tr.meta.module === 'FTB-TEST-1');
+  T('Fiber identifier', fib && fib[0].identifier === 'FIBER-A', fib && fib[0].identifier);
+
+  // 3. события
+  const evs = tr ? tr.events : [];
+  T('5 событий EventTable', evs.length === 5, String(evs.length));
+  const pts = evs.filter(e => e.kind === 'point'), secs = evs.filter(e => e.kind === 'section');
+  T('3 point + 2 section', pts.length === 3 && secs.length === 2, `${pts.length}+${secs.length}`);
+  T('port event: status=72, dist=0', pts[0] && pts[0].status === 72 && pts[0].dist === 0);
+  T('port Loss(NaN) → null', pts[0] && pts[0].loss === null);
+  T('QC event: dist ≈ 320 м, loss 0.42', pts[1] && near(pts[1].dist, 320, 1e-9) && near(pts[1].loss, 0.42, 1e-9));
+  T('end event: status=132, dist ≈ конец', pts[2] && pts[2].status === 132 && near(pts[2].dist, (NSAMP - 3) * stepM, 1e-9));
+  T('section: length/loss прочитаны', secs[1] && near(secs[1].length, (NSAMP - 3 - 320) * stepM, 1e-6));
+
+  // 4. негативный тест: не .trc
+  let threw = false;
+  try { parseTrcFile(new Uint8Array([1, 2, 3, 4, 5]).buffer); } catch (e) { threw = true; }
+  T('мусор отклонён (ошибка)', threw);
+
+  // 5. inflate round-trip против эталонного DecompressionStream (динамические блоки + LZ77)
+  if (typeof CompressionStream === 'function' && typeof DecompressionStream === 'function') {
+    (async () => {
+      async function deflateRaw(u8) {
+        const cs = new CompressionStream('deflate-raw');
+        const w = cs.writable.getWriter(); w.write(u8); w.close();
+        return new Uint8Array(await new Response(cs.readable).arrayBuffer());
+      }
+      const parts = [];
+      for (let i = 0; i < 300; i++) parts.push('block' + (i % 7) + ' payload ' + (i * 137 % 251) + ' xyzzy');
+      const data = new TextEncoder().encode(parts.join(' '));
+      try {
+        const z = await deflateRaw(data);
+        const mine = inflateRaw(z, 0).data;
+        let same = mine.length === data.length;
+        for (let i = 0; same && i < data.length; i++) if (mine[i] !== data[i]) same = false;
+        T('inflate vs CompressionStream round-trip (dynamic+LZ77)', same,
+          same ? '' : 'first diff @ ' + [...data.keys()].find(i => mine[i] !== data[i]));
+        // тот же поток через полный zlib (с CMF/FLG + Adler)
+        const cs = new CompressionStream('deflate');
+        const w = cs.writable.getWriter(); w.write(data); w.close();
+        const zz = new Uint8Array(await new Response(cs.readable).arrayBuffer());
+        const r2 = inflateRaw(zz, 2);
+        let same2 = r2.data.length === data.length;
+        for (let i = 0; same2 && i < data.length; i++) if (r2.data[i] !== data[i]) same2 = false;
+        const ad = ((zz[zz.length - 4] << 24) | (zz[zz.length - 3] << 16) | (zz[zz.length - 2] << 8) | zz[zz.length - 1]) >>> 0;
+        T('inflate полного zlib-потока + Adler', same2 && ad === adler32(r2.data));
+      } catch (e) { T('inflate round-trip (dynamic)', false, e.message); }
+      finish();
+    })();
+  } else { finish(); }
+
+  function finish() {
+    const s = document.getElementById('summary');
+    s.className = fail ? 'fail' : 'ok';
+    s.textContent = `ИТОГ: ${pass} PASS, ${fail} FAIL`;
+  }
+
+  // ---------------- опционально: реальный файл ----------------
+  document.getElementById('real').addEventListener('change', e => {
+    if (!e.target.files.length) return;
+    e.target.files[0].arrayBuffer().then(buf => {
+      const pre = document.getElementById('realOut');
+      try {
+        const fs = parseTrcFile(buf);
+        let txt = '';
+        for (const f of fs) for (const t2 of f.traces) {
+          txt += `${f.name} / ${t2.name}: ${t2.wavelengthNm} nm, ${t2.samples.length} samples, max ${traceMaxDist(t2).toFixed(1)} m\n`;
+          for (const ev of t2.events)
+            txt += `  ${ev.kind} status=${ev.status} dist=${ev.dist.toFixed(2)} m loss=${ev.loss} refl=${ev.reflectance}\n`;
+        }
+        pre.textContent = txt;
+      } catch (err) { pre.textContent = 'parse error: ' + err.message; }
+    });
+  });
+})();
+</script>
+</body>
+</html>

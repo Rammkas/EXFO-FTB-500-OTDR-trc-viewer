@@ -1,0 +1,5 @@
+# Normalize line endings: LF in the repository (the app is browser-based)
+* text=auto eol=lf
+*.trc binary
+*.png binary
+*.jpeg binary

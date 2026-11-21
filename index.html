@@ -1,0 +1,1053 @@
+<!DOCTYPE html>
+<!--
+  ============================================================================
+  TrcViewer — интерактивный просмотрщик рефлектограмм EXFO FTB-500 (.trc)
+  ============================================================================
+  Открывается двойным кликом в любом современном браузере, работает офлайн,
+  без сервера, без Node/Python/Excel. Файлы: index.html + otdr-parser.js.
+
+  .trc разбирается НАПРЯМУЮ в браузере: JavaScript-порт формата, описанного
+  в ExfoTrcAnalyzer/FORMAT.md:
+    * поиск zlib-чанков (CMF=0x78, правило RFC1950 (CMF*256+FLG)%31==0),
+      собственный inflate (RFC1950), проверка Adler-32 большого порядка;
+    * дерево узлов 16-байтных заголовков (Container/Int32/BinaryRef/Double/
+      Utf16String), корень OtdrFile;
+    * кривые RawSamples: Int16 LE, ScaleFactor counts/dB, равномерная
+      временная ось t_i = RangeStart + i*SamplingPeriod,
+      dist_i = t_i * Range / (RangeEnd - RangeStart);
+    * EventTable: позиции/потери/отражения событий EXFO (Status 72 = порт,
+      0 = отражающее событие, 132 = конец волокна; LMA-секции без Type).
+
+  Возможности графика: зум колесом, панорамирование, рамочный зум (Shift+drag),
+  авто-Y / фиксация Y, обе длины волн, маркеры событий с подсказками,
+  курсоры A/B с расчётом Δdistance, ΔdB и затухания дБ/км, пресеты обзора.
+  Интерфейс UA/EN/RU (переключатель в шапке, по умолчанию UA); карточки
+  метаданных сворачиваются влево (свёрнуты по умолчанию), карточка измерений
+  волокна всегда видна; печать/сохранение в PDF на один лист.
+
+  Тест парсера: tests/selftest.html (тот же код парсера, прогон на синтетике
+  и на реальном файле через загрузку).
+  ============================================================================
+-->
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TrcViewer — EXFO FTB-500 reflectogram viewer</title>
+<style>
+  :root {
+    --bg: #f4f6f8; --panel: #ffffff; --ink: #1c2733; --muted: #67788a;
+    --line: #d7dee6; --accent: #1a6fb0; --wl1: #1a6fb0; --wl2: #d1495b;
+    --curA: #0a7d33; --curB: #b25a00; --end: #b25a00; --port: #67788a;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 "Segoe UI", system-ui, Arial, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 16px; margin: 0 8px 0 0; }
+  .langbtn { display: flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .langbtn button { border: 0; background: var(--panel); padding: 4px 10px; cursor: pointer; color: var(--muted); }
+  .langbtn button.on { background: var(--accent); color: #fff; }
+  .filebox { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+  .filebox label.btn {
+    background: var(--accent); color: #fff; border-radius: 6px; padding: 6px 12px; cursor: pointer;
+  }
+  #fileSel { display: none; }
+  #fiberSel { padding: 4px 6px; border-radius: 6px; border: 1px solid var(--line); }
+  #cardsrow {
+    display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap;
+    padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  #meta { display: flex; gap: 8px; flex-wrap: wrap; }
+  /* постоянные карточки (TrcViewer, длины волн) — сворачиваются влево кнопкой
+     «Метадані»; карточка измерений волокна вне контейнера — всегда видна */
+  #permCards { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start; }
+  #cardsrow.collapsed #permCards { display: none; }
+  #btnMetaToggle { display: inline-flex; align-items: center; gap: 5px; }
+  #btnMetaToggle .chev { font-weight: 700; font-size: 14px; line-height: 1; color: var(--accent); }
+  #cardsrow.collapsed #btnMetaToggle { color: var(--muted); }
+  .card {
+    border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; min-width: 150px;
+  }
+  .card h3 { margin: 0 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .card div { font-size: 13px; }
+  #controls {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  #controls .grp { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  button.ctl, select {
+    border: 1px solid var(--line); background: var(--panel); border-radius: 6px;
+    padding: 5px 10px; cursor: pointer; font: inherit; color: var(--ink);
+  }
+  button.ctl:hover { border-color: var(--accent); }
+  button.ctl { white-space: nowrap; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 2px; }
+  #plotwrap { position: relative; flex: 1; min-height: 240px; margin: 4px 14px 4px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  #plot { display: block; width: 100%; height: 100%; cursor: crosshair; }
+  #tooltip {
+    position: absolute; display: none; pointer-events: none; z-index: 5;
+    background: #213040; color: #eef3f8; border-radius: 6px; padding: 6px 9px;
+    font-size: 12.5px; max-width: 320px; white-space: pre;
+  }
+  #dropzone {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    background: rgba(26,111,176,.12); border: 2px dashed var(--accent); border-radius: 8px;
+    font-size: 18px; color: var(--accent); z-index: 6;
+  }
+  #readout { display: flex; gap: 8px; flex-wrap: wrap; }
+  #readout:empty { display: none; }
+  #statusbar {
+    padding: 8px 14px 12px; color: var(--muted); font-size: 12.5px;
+    display: flex; gap: 16px; flex-wrap: wrap;
+  }
+  #statusbar #hoverInfo { margin-left: auto; }
+  .ro { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 6px 10px; font-size: 13px; }
+  .ro b { font-weight: 600; }
+  .ro table { border-collapse: collapse; }
+  .ro td { padding: 1px 8px 1px 0; }
+  footer {
+    padding: 5px 14px 9px; color: var(--muted); font-size: 12.5px;
+    display: flex; gap: 16px; flex-wrap: wrap;
+  }
+  #status.err { color: #b02a37; }
+  .hint { color: var(--muted); font-size: 12px; }
+
+  /* ПЕЧАТЬ / PDF — один лист. Никаких фиксированных миллиметров в макете:
+     реальная ширина области печати в CSS-пикселах зависит от браузера/драйвера
+     (у Firefox она оказалась вдвое больше «96 dpi»), поэтому всё задаём
+     относительными величинами: ширина блоков = ширина страницы, график
+     (flex) забирает остаток высоты. body ограничен высотой страницы и
+     overflow:hidden — второй страницы быть не может физически. */
+  @page { size: A4 landscape; margin: 8mm; }
+  @media print {
+    html, body { height: 100%; }
+    /* min(100vh, 100%): в печати 100% = высота страницы (ICB), 100vh у разных
+       браузеров может считаться и от экрана — берём меньшее, чтобы тело никогда
+       не оказалось выше листа; overflow:hidden добирает остаток */
+    body {
+      height: min(100vh, 100%); max-height: 100%; overflow: hidden; background: #fff;
+    }
+    #controls, #fileSel, #fileName, #tooltip, #dropzone, #hoverInfo, footer,
+    .filebox label.btn, #btnMetaToggle { display: none !important; }
+    /* печать = текущее состояние главного окна: свёрнутые метаданные печатаются
+       свёрнутыми (кнопка в PDF не нужна), развернутые — развернутыми */
+    header, #cardsrow, #statusbar { border: 0; padding: 0 0 4px; background: #fff; }
+    #statusbar { color: #38485a; }
+    #plotwrap { flex: 1 1 auto; min-height: 35%; margin: 4px 0 0; border-radius: 0; }
+    /* канвас заполняет блок целиком: пустых полос сверху/снизу не остаётся,
+       а «печатная» геометрия канваса подобрана под реальное соотношение сторон
+       этого блока на альбомном A4 (PRINT_ASPECT) */
+    .card { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1 data-i18n="title"></h1>
+  <div class="langbtn">
+    <button id="langUa">UA</button><button id="langEn">EN</button><button id="langRu">RU</button>
+  </div>
+  <select id="fiberSel" hidden></select>
+  <div class="filebox">
+    <span id="fileName" class="hint"></span>
+    <button class="ctl" id="btnPrint" data-i18n="print"></button>
+    <label class="btn" for="fileSel" data-i18n="openFile"></label>
+    <input type="file" id="fileSel" accept=".trc">
+  </div>
+</header>
+
+<div id="cardsrow" class="collapsed">
+  <button class="ctl" id="btnMetaToggle" aria-expanded="false" aria-controls="permCards">
+    <span class="chev" id="metaChev">›</span><span data-i18n="metaCards"></span>
+  </button>
+  <section id="meta"></section>
+  <section id="readout"></section>
+</div>
+
+<section id="controls">
+  <div class="grp" id="seriesGrp"></div>
+  <div class="grp">
+    <label><input type="checkbox" id="cbEvents" checked> <span data-i18n="showEvents"></span></label>
+    <label><input type="checkbox" id="cbYAuto" checked> <span data-i18n="yAuto"></span></label>
+    <button class="ctl" id="btnFitY" data-i18n="fitY"></button>
+  </div>
+  <div class="grp">
+    <span data-i18n="presets"></span>:
+    <button class="ctl" id="pFull" data-i18n="presetFull"></button>
+    <button class="ctl" id="pStart" data-i18n="presetStart"></button>
+    <button class="ctl" id="pQC" data-i18n="presetQC"></button>
+    <button class="ctl" id="pFiber" data-i18n="presetFiber"></button>
+    <button class="ctl" id="pEnd" data-i18n="presetEnd"></button>
+  </div>
+  <div class="grp">
+    <span data-i18n="cursors"></span>:
+    <button class="ctl" id="btnA" data-i18n="placeA"></button>
+    <button class="ctl" id="btnB" data-i18n="placeB"></button>
+    <button class="ctl" id="btnClear" data-i18n="clearCursors"></button>
+  </div>
+  <span class="hint" data-i18n="mouseHint"></span>
+</section>
+
+<div id="plotwrap">
+  <canvas id="plot"></canvas>
+  <div id="tooltip"></div>
+  <div id="dropzone"></div>
+</div>
+
+<div id="statusbar">
+  <span id="status"></span>
+  <span id="hoverInfo"></span>
+</div>
+
+<script src="otdr-parser.js"></script>
+<script>
+
+
+// ============================================================================
+// UI: график на canvas, зум/пан, курсоры A/B, события, RU/UA/EN
+// ============================================================================
+(function () {
+  const $ = id => document.getElementById(id);
+
+  // ---------------- i18n ----------------
+  const I18N = {
+    ru: {
+      title: 'Просмотрщик рефлектограмм EXFO FTB-500',
+      openFile: 'Открыть .trc', print: 'Печать', metaCards: 'Метаданные', dropHint: 'Отпустите файл .trc здесь',
+      showEvents: 'События', yAuto: 'Авто-Y', fitY: 'Подогнать Y', presets: 'Пресеты',
+      presetFull: 'Весь диапазон', presetStart: 'Старт 0–30 м', presetQC: 'Буфер 0–1200 м', presetEnd: 'Конец ±50 м',
+      presetFiber: 'Волокно (после буфера)', attenKm: 'Затухание, дБ/км',
+      fiberMeas: 'Волокно (измерения)', fiberLen: 'Длина волокна', attenShort: 'Затухание',
+      viewRange: 'Диапазон', dBkm: 'дБ/км', segLen: 'Длина участка',
+      cursors: 'Курсоры', placeA: 'Курсор A', placeB: 'Курсор B', clearCursors: 'Сбросить',
+      mouseHint: 'колесо — зум, drag — панорама, Shift+drag — рамочный зум, двойной клик — сброс',
+      fiber: 'Волокно', fiberCode: 'Код', date: 'Дата', module: 'Модуль', serial: 'S/N',
+      injection: 'Инжекция, дБ', spanLength: 'Длина спана, м', spanLoss: 'Потери спана, дБ',
+      orl: 'ORL, дБ', noise: 'RMS шум, дБ', samples: 'отсчётов',
+      ev_port: 'порт', ev_reflect: 'отражающее событие', ev_end: 'конец волокна',
+      ev_event: 'событие', ev_section: 'секция',
+      loss: 'Потери, дБ', refl: 'Отражение, дБ', pos: 'Позиция, м', len: 'Длина, м',
+      cursorA: 'Курсор A', cursorB: 'Курсор B', dist: 'Расстояние', level: 'Уровень',
+      deltaDist: 'Δdistance', deltaDb: 'ΔdB', atten: 'Затухание',
+      loaded: 'Загружено', parseTime: 'время разбора', noData: 'Нет данных — откройте файл .trc',
+      err: 'Ошибка разбора', notTrc: 'похоже, это не .trc FTB-500',
+      wlUnknown: 'длина волны неизвестна',
+    },
+    en: {
+      title: 'EXFO FTB-500 reflectogram viewer',
+      openFile: 'Open .trc', print: 'Print', metaCards: 'Metadata', dropHint: 'Drop a .trc file here',
+      showEvents: 'Events', yAuto: 'Auto-Y', fitY: 'Fit Y', presets: 'Presets',
+      presetFull: 'Full range', presetStart: 'Start 0–30 m', presetQC: 'Buffer 0–1200 m', presetEnd: 'End ±50 m',
+      presetFiber: 'Fiber (after buffer)', attenKm: 'Attenuation, dB/km',
+      fiberMeas: 'Fiber (measured)', fiberLen: 'Fiber length', attenShort: 'Attenuation',
+      viewRange: 'Range', dBkm: 'dB/km', segLen: 'Segment length',
+      cursors: 'Cursors', placeA: 'Cursor A', placeB: 'Cursor B', clearCursors: 'Clear',
+      mouseHint: 'wheel — zoom, drag — pan, Shift+drag — box zoom, double click — reset',
+      fiber: 'Fiber', fiberCode: 'Code', date: 'Date', module: 'Module', serial: 'S/N',
+      injection: 'Injection, dB', spanLength: 'Span length, m', spanLoss: 'Span loss, dB',
+      orl: 'ORL, dB', noise: 'RMS noise, dB', samples: 'samples',
+      ev_port: 'port', ev_reflect: 'reflection event', ev_end: 'fiber end',
+      ev_event: 'event', ev_section: 'section',
+      loss: 'Loss, dB', refl: 'Reflectance, dB', pos: 'Position, m', len: 'Length, m',
+      cursorA: 'Cursor A', cursorB: 'Cursor B', dist: 'Distance', level: 'Level',
+      deltaDist: 'Δdistance', deltaDb: 'ΔdB', atten: 'Attenuation',
+      loaded: 'Loaded', parseTime: 'parse time', noData: 'No data — open a .trc file',
+      err: 'Parse error', notTrc: 'looks like a non FTB-500 .trc',
+      wlUnknown: 'wavelength unknown',
+    },
+    uk: {
+      title: 'Переглядач рефлектограм EXFO FTB-500',
+      openFile: 'Відкрити .trc', print: 'Друк', metaCards: 'Метадані', dropHint: 'Відпустіть файл .trc тут',
+      showEvents: 'Події', yAuto: 'Авто-Y', fitY: 'Підлаштувати Y', presets: 'Пресети',
+      presetFull: 'Весь діапазон', presetStart: 'Старт 0–30 м', presetQC: 'Буфер 0–1200 м', presetEnd: 'Кінець ±50 м',
+      presetFiber: 'Волокно (після буфера)', attenKm: 'Затухання, дБ/км',
+      fiberMeas: 'Волокно (вимірювання)', fiberLen: 'Довжина волокна', attenShort: 'Затухання',
+      viewRange: 'Діапазон', dBkm: 'дБ/км', segLen: 'Довжина ділянки',
+      cursors: 'Курсори', placeA: 'Курсор A', placeB: 'Курсор B', clearCursors: 'Скинути',
+      mouseHint: 'колесо — зум, drag — панорама, Shift+drag — рамковий зум, подвійний клік — скидання',
+      fiber: 'Волокно', fiberCode: 'Код', date: 'Дата', module: 'Модуль', serial: 'S/N',
+      injection: 'Інжекція, дБ', spanLength: 'Довжина спана, м', spanLoss: 'Втрати спана, дБ',
+      orl: 'ORL, дБ', noise: 'RMS шум, дБ', samples: 'відліків',
+      ev_port: 'порт', ev_reflect: 'відбивна подія', ev_end: 'кінець волокна',
+      ev_event: 'подія', ev_section: 'секція',
+      loss: 'Втрати, дБ', refl: 'Відбивання, дБ', pos: 'Позиція, м', len: 'Довжина, м',
+      cursorA: 'Курсор A', cursorB: 'Курсор B', dist: 'Відстань', level: 'Рівень',
+      deltaDist: 'Δdistance', deltaDb: 'ΔdB', atten: 'Затухання',
+      loaded: 'Завантажено', parseTime: 'час розбору', noData: 'Немає даних — відкрийте файл .trc',
+      err: 'Помилка розбору', notTrc: 'схоже, це не .trc FTB-500',
+      wlUnknown: 'довжина хвилі невідома',
+    },
+  };
+  let lang = 'uk'; // локализация по умолчанию — украинская
+  const t = k => (I18N[lang] && I18N[lang][k]) || k;
+
+  // ---------------- состояние ----------------
+  const state = {
+    fibers: [], fiberIdx: 0,
+    visible: [],            // индекс видимой серии на каждое волокно: visible[traceIdx]
+    x0: 0, x1: 1000,        // окно обзора, метры
+    yFixed: null,           // фиксированный Y-диапазон [min,max] при снятом «Авто-Y»
+    curA: null, curB: null, // позиции курсоров, метры
+    showEvents: true, yAuto: true,
+    fileName: '',
+  };
+  // экспорт для автотестов (tests/selftest.html и смоук-тестов)
+  window.TRC_VIEWER_STATE = state;
+  window.TRC_TEST = { snapEventDist, attenuationIn, distToX: d => distToX(d), plotGeom: () => ({ W, H }) }; // хук автотестов
+  const fiber = () => state.fibers[state.fiberIdx] || null;
+  const seriesColor = i => i === 0 ? '#1a6fb0' : '#d1495b';
+  const seriesLabel = tr => tr.wavelengthNm ? tr.wavelengthNm + ' nm' : t('wlUnknown');
+
+  const traceDist = (tr, i) => traceDistAt(tr, i);
+  const traceDistInv = (tr, d) => Math.round((d - tr.rangeStartS * tr.rangeM / (tr.rangeEndS - tr.rangeStartS)) / traceStepM(tr));
+
+  // ---------------- canvas и геометрия ----------------
+  const canvas = $('plot'), ctx = canvas.getContext('2d');
+  const PAD = { l: 62, r: 14, t: 12, b: 38 };
+  let W = 0, H = 0, DPR = 1;
+  let printScale = 1; // на время печати — повышенное разрешение канваса (чёткие линии в PDF)
+  // «печатная» геометрия канваса: область графика на альбомном A4. Соотношение
+  // сторон зависит от того, свёрнуты метаданные: с ними карточки занимают меньше
+  // высоты листа, поэтому график получается выше (меньшее отношение сторон).
+  // Значения откалиброваны под блок графика на альбомном A4 (281×~105 мм при
+  // свёрнутых метаданных и ~281×~93 мм при развернутых).
+  const PRINT_W = 1400, PRINT_ASPECT = 2.9, PRINT_ASPECT_COLLAPSED = 2.6;
+  let printGeom = null; // геометрия канваса на время печати
+  let yMin = 0, yMax = 30;
+  // Y-масштаб пересчитывается только по «явным» действиям (зум, пресет/смена
+  // окна, смена серий, загрузка, переключатель Авто-Y). Панорамирование —
+  // drag или горизонтальное колесо — Y никогда не меняет.
+  let yDirty = true;
+
+  function resize() {
+    const wrap = $('plotwrap');
+    DPR = (window.devicePixelRatio || 1) * printScale;
+    if (printGeom) { W = printGeom.w; H = printGeom.h; } // геометрия для печати
+    else { W = wrap.clientWidth; H = wrap.clientHeight; }
+    canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    render();
+  }
+  window.addEventListener('resize', resize);
+
+  const plotW = () => W - PAD.l - PAD.r;
+  const plotH = () => H - PAD.t - PAD.b;
+  const distToX = d => PAD.l + (d - state.x0) / (state.x1 - state.x0) * plotW();
+  const xToDist = x => state.x0 + (x - PAD.l) / plotW() * (state.x1 - state.x0);
+  const dbToY = d => PAD.t + (yMax - d) / (yMax - yMin) * plotH();
+
+  const visibleTraces = () => {
+    const f = fiber(); if (!f) return [];
+    return f.traces.filter((tr, i) => tr.samples && tr.hasGrid && state.visible[i]);
+  };
+
+  // подписи на графике: чуть вытянутые по вертикали (жирные шрифты задаются
+  // в ctx.font вызывающим кодом)
+  function fillTextV(text, x, y, stretch) {
+    const s = stretch || 1.18;
+    ctx.save(); ctx.translate(x, y); ctx.scale(1, s); ctx.fillText(text, 0, 0); ctx.restore();
+  }
+
+  // ---------------- рендер ----------------
+  function niceStep(span, maxTicks) {
+    const raw = span / maxTicks, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    for (const m of [1, 2, 5, 10]) if (m * mag >= raw) return m * mag;
+    return 10 * mag;
+  }
+
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+    const traces = visibleTraces();
+    if (!traces.length) {
+      ctx.fillStyle = '#93a3b3'; ctx.font = '15px "Segoe UI", sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(t('noData'), W / 2, H / 2); ctx.textAlign = 'left';
+      return;
+    }
+
+    // Y-масштаб: yFixed — явная блокировка («Авто-Y» выключен); иначе
+    // пересчёт только при yDirty (зум/пресет/серии/загрузка). Панорама Y не трогает.
+    if (state.yFixed) {
+      yMin = state.yFixed[0]; yMax = state.yFixed[1];
+    } else if (yDirty) {
+      // Y-масштаб по явным действиям (загрузка/пресет/рамочный зум/серии/
+      // «Подогнать Y»): полоса трассы по перцентилям 2–98%, затем в шкалу
+      // добавляются пики отражений по краям окна, но не более +12 дБ сверху
+      // и -10 дБ снизу — ADC-выброс/звон порта (±37 дБ) шкалу не растягивает.
+      // Шум за концом волокна (Status 132) учитывается только если окно
+      // почти целиком — шумовая зона, иначе он зря утягивает шкалу вниз.
+      const valsF = [], valsT = [];
+      let fMin = Infinity, fMax = -Infinity, aMin = Infinity, aMax = -Infinity;
+      for (const tr of traces) {
+        const i0 = Math.max(0, traceDistInv(tr, state.x0)), i1 = Math.min(tr.samples.length - 1, traceDistInv(tr, state.x1));
+        let iEnd = i1; // samples <= iEnd — «волокно», дальше — шум за концом
+        const endEv = tr.events && tr.events.find(e => e.kind === 'point' && e.status === 132);
+        if (endEv && endEv.dist > state.x0 && endEv.dist < state.x1) iEnd = Math.min(i1, traceDistInv(tr, endEv.dist + 50));
+        const stride = Math.max(1, Math.floor((i1 - i0) / 4000)); // подвыборка — перцентилям её достаточно
+        for (let i = i0; i <= i1; i++) {
+          const v = traceLevelDb(tr, i);
+          if (v < aMin) aMin = v;
+          if (v > aMax) aMax = v;
+          if (i <= iEnd) { if (v < fMin) fMin = v; if (v > fMax) fMax = v; }
+          if ((i - i0) % stride === 0) (i <= iEnd ? valsF : valsT).push(v);
+        }
+      }
+      const nF = valsF.length;
+      const useFiber = nF && nF >= (nF + valsT.length) * 0.6;
+      const vals = useFiber ? valsF : valsF.concat(valsT);
+      const extMin = useFiber ? fMin : aMin, extMax = useFiber ? fMax : aMax;
+      if (!vals.length) { yMin = 0; yMax = 30; }
+      else {
+        vals.sort((a, b) => a - b);
+        let lo = vals[Math.floor(vals.length * 0.02)];
+        let hi = vals[Math.min(vals.length - 1, Math.ceil(vals.length * 0.98))];
+        if (hi - lo < 1) { const mid = vals[vals.length >> 1]; lo = mid - 0.5; hi = mid + 0.5; }
+        if (extMax > hi) hi = Math.min(extMax, hi + 12);
+        if (extMin < lo) lo = Math.max(extMin, lo - 6);
+        const pad = Math.max((hi - lo) * 0.08, 0.3);
+        yMin = lo - pad; yMax = hi + pad;
+      }
+      yDirty = false;
+    }
+    state.yMin = yMin; state.yMax = yMax; // для диагностики/автотестов
+
+    // сетка + оси
+    ctx.strokeStyle = '#e3e9ef'; ctx.lineWidth = 1; ctx.fillStyle = '#67788a'; ctx.font = 'bold 11.5px "Segoe UI", sans-serif';
+    const xs = niceStep(state.x1 - state.x0, 10);
+    for (let d = Math.ceil(state.x0 / xs) * xs; d <= state.x1; d += xs) {
+      const x = distToX(d);
+      ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, H - PAD.b); ctx.stroke();
+      ctx.textAlign = 'center';
+      fillTextV(xs >= 1000 ? (d / 1000).toFixed(1).replace(/\.0$/, '') + ' km' : d.toFixed(0) + ' m', x, H - PAD.b + 15);
+    }
+    const ys = niceStep(yMax - yMin, 8);
+    for (let v = Math.ceil(yMin / ys) * ys; v <= yMax; v += ys) {
+      const y = dbToY(v);
+      ctx.beginPath(); ctx.moveTo(PAD.l, y); ctx.lineTo(W - PAD.r, y); ctx.stroke();
+      ctx.textAlign = 'right';
+      fillTextV(v.toFixed(ys < 1 ? 1 : 0), PAD.l - 6, y + 4);
+    }
+    ctx.strokeStyle = '#c4ccd5';
+    ctx.strokeRect(PAD.l, PAD.t, plotW(), plotH());
+    ctx.save(); ctx.translate(14, PAD.t + plotH() / 2); ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = 'center'; ctx.fillText('dB', 0, 0); ctx.restore();
+
+    // кривые: тонкая «средняя» линия постоянной толщины + полупрозрачная
+    // огибающая min/max (пики отражений и шум сохранены). При зуме линия
+    // не «скачет» толстая→тонкая: шум превращается в мягкую подсветку вокруг
+    // стабильной средней линии, а не в саму толщину кривой.
+    const withAlpha = (hex, a) => {
+      const m = /^#?([0-9a-f]{6})$/i.exec(hex);
+      if (!m) return hex;
+      const n = parseInt(m[1], 16);
+      return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+    };
+    ctx.save();
+    ctx.beginPath(); ctx.rect(PAD.l, PAD.t, plotW(), plotH()); ctx.clip();
+    for (let ti = 0; ti < fiber().traces.length; ti++) {
+      const tr = fiber().traces[ti];
+      if (!tr.samples || !tr.hasGrid || !state.visible[ti]) continue;
+      const iEnd = tr.samples.length - 1;
+      const cols = [];
+      for (let px = 0; px < plotW(); px++) {
+        const iFrom = Math.max(0, traceDistInv(tr, xToDist(PAD.l + px)));
+        const iTo = Math.min(iEnd, traceDistInv(tr, xToDist(PAD.l + px + 1)));
+        if (iFrom > iTo) continue; // пустой пиксель — линия соединит соседние колонки
+        let mn = Infinity, mx = -Infinity, sum = 0;
+        for (let i = iFrom; i <= iTo; i++) { const v = traceLevelDb(tr, i); if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
+        cols.push({ x: PAD.l + px + 0.5, ym: dbToY(sum / (iTo - iFrom + 1)), yt: dbToY(mx), yb: dbToY(mn) });
+      }
+      if (!cols.length) continue;
+      const color = seriesColor(ti);
+      ctx.beginPath();
+      ctx.moveTo(cols[0].x, cols[0].yt);
+      for (const col of cols) ctx.lineTo(col.x, col.yt);
+      for (let k = cols.length - 1; k >= 0; k--) ctx.lineTo(cols[k].x, Math.max(cols[k].yb, cols[k].yt + 0.3));
+      ctx.closePath();
+      ctx.fillStyle = withAlpha(color, 0.30);
+      ctx.fill();
+      ctx.strokeStyle = color; ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(cols[0].x, cols[0].ym);
+      for (const col of cols) ctx.lineTo(col.x, col.ym);
+      ctx.stroke();
+    }
+
+    // события
+    if (state.showEvents) {
+      for (const tr of fiber().traces) {
+        for (const ev of tr.events) {
+          if (ev.dist < state.x0 || ev.dist > state.x1) continue;
+          const x = distToX(ev.dist);
+          const color = ev.kind === 'section' ? '#b8c4d0'
+            : ev.status === 132 ? '#b25a00' : ev.status === 72 ? '#67788a' : '#2e7d32';
+          ctx.strokeStyle = color; ctx.lineWidth = ev.kind === 'section' ? 1 : 1.4;
+          ctx.setLineDash(ev.kind === 'section' ? [4, 4] : []);
+          ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, H - PAD.b); ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
+      // подписи в два ряда, чтобы не сливались
+      const evs = fiber().traces[0] ? fiber().traces.flatMap(tr => tr.events) : [];
+      const drawn = evs.filter(ev => ev.kind !== 'section' && ev.dist >= state.x0 && ev.dist <= state.x1)
+        .sort((a, b) => a.dist - b.dist);
+      ctx.font = 'bold 11.5px "Segoe UI", sans-serif';
+      let lastX = -100;
+      for (const ev of drawn) {
+        const x = distToX(ev.dist);
+        if (x - lastX < 55) continue; lastX = x;
+        const label = evLabel(ev);
+        ctx.fillStyle = '#42525f'; ctx.textAlign = 'left';
+        fillTextV(label, x + 3, PAD.t + 14);
+        fillTextV(fmtM(ev.dist), x + 3, PAD.t + 27);
+      }
+    }
+
+    // курсоры A/B
+    for (const [name, pos, color] of [['A', state.curA, '#0a7d33'], ['B', state.curB, '#b25a00']]) {
+      if (pos === null || pos < state.x0 || pos > state.x1) continue;
+      const x = distToX(pos);
+      ctx.strokeStyle = color; ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, H - PAD.b); ctx.stroke();
+      ctx.fillStyle = color; ctx.font = 'bold 13px "Segoe UI", sans-serif'; ctx.textAlign = 'center';
+      fillTextV(name, x, PAD.t + 12, 1.22);
+    }
+
+    // затухание выбранного диапазона: курсоры A–B (если заданы) или окно обзора
+    const useCur = state.curA !== null && state.curB !== null;
+    const rD0 = useCur ? Math.min(state.curA, state.curB) : state.x0;
+    const rD1 = useCur ? Math.max(state.curA, state.curB) : state.x1;
+    const rows = [{ text: `${useCur ? t('cursors') + ' A\u2013B' : t('viewRange')}: ${fmtM(rD0)} \u2013 ${fmtM(rD1)}`, color: '#42525f' },
+                  { text: `${t('segLen')}: ${fmtM(rD1 - rD0)}`, color: '#42525f' }];
+    for (const tr of traces) {
+      const a = attenuationIn(tr, rD0, rD1);
+      rows.push({ text: `${seriesLabel(tr)}: ${a === null ? '\u2014' : a.toFixed(3) + ' ' + t('dBkm')}`,
+                  color: seriesColor(fiber().traces.indexOf(tr)) });
+    }
+    ctx.font = 'bold 12.5px "Segoe UI", sans-serif';
+    let wMax = 0;
+    for (const r of rows) wMax = Math.max(wMax, ctx.measureText(r.text).width);
+    const boxW = wMax + 14, boxH = rows.length * 17 + 6;
+    const bx = W - PAD.r - boxW - 4, by = PAD.t + 4;
+    ctx.fillStyle = 'rgba(255,255,255,0.88)'; ctx.strokeStyle = '#c4ccd5'; ctx.lineWidth = 1;
+    ctx.fillRect(bx, by, boxW, boxH); ctx.strokeRect(bx, by, boxW, boxH);
+    ctx.textAlign = 'left';
+    rows.forEach((r, i) => { ctx.fillStyle = r.color; fillTextV(r.text, bx + 7, by + 13 + i * 17); });
+
+    ctx.restore();
+
+    renderReadout(traces);
+  }
+
+  function evLabel(ev) {
+    if (ev.kind === 'section') return t('ev_section');
+    if (ev.status === 72) return t('ev_port');
+    if (ev.status === 132) return t('ev_end');
+    if (ev.status === 0) return t('ev_reflect');
+    return t('ev_event');
+  }
+  function fmtM(d) { return d >= 1000 ? (d / 1000).toFixed(3).replace(/0+$/, '').replace(/\.$/, '') + ' km' : d.toFixed(1) + ' m'; }
+  function fmtDb(v) { return v === null || v === undefined ? '—' : v.toFixed(3); }
+
+  // Затухание подопытного волокна (участок QC-коннектор → конец волокна), дБ/км:
+  // сначала по LMA-секции EventTable (как в GOLD анализатора), при её отсутствии —
+  // по наклону сырой кривой со сглаживанием по окну 300 отсчётов.
+  function traceAttenuation(tr) {
+    if (!tr.samples || !tr.hasGrid) return null;
+    const pts = tr.events.filter(e => e.kind === 'point');
+    const qc = pts.find(e => e.status === 0);
+    const end = pts.find(e => e.status === 132);
+    if (!qc || !end || end.dist <= qc.dist) return null;
+    const sec = tr.events.find(e => e.kind === 'section' && e.length && e.loss !== null &&
+      Math.abs(e.dist - qc.dist) < 50 && Math.abs(e.dist + e.length - end.dist) < 50);
+    if (sec) return sec.loss / (sec.length / 1000);
+    const avg = i => { let s = 0; for (let k = i; k < i + 300; k++) s += traceLevelDb(tr, k); return s / 300; };
+    const i1 = Math.max(0, Math.min(tr.samples.length - 301, traceDistInv(tr, qc.dist + 100)));
+    const i2 = Math.max(i1 + 301, Math.min(tr.samples.length - 300, traceDistInv(tr, end.dist - 100)));
+    const km = (traceDistAt(tr, i2) - traceDistAt(tr, i1)) / 1000;
+    return km > 0.1 ? (avg(i1) - avg(i2)) / km : null;
+  }
+
+  // ---------------- курсоры: сводка ----------------
+  function levelAt(tr, distM) {
+    const i = Math.max(0, Math.min(tr.samples.length - 1, traceDistInv(tr, distM)));
+    return traceLevelDb(tr, i);
+  }
+  function renderReadout(traces) {
+    const box = $('readout'); box.innerHTML = '';
+    if (state.curA === null || state.curB === null) return;
+    for (const tr of traces) {
+      const la = levelAt(tr, state.curA), lb = levelAt(tr, state.curB);
+      const dd = state.curB - state.curA;
+      const ddb = lb - la;
+      // устойчивая оценка затухания (медианы по карманам + НМК, без ступенек
+      // событий и пиков) — та же, что в оверлее на графике; сырой ΔdB/Δkm
+      // бессмысленен, когда курсор стоит на пике отражения
+      const atten = attenuationIn(tr, Math.min(state.curA, state.curB), Math.max(state.curA, state.curB));
+      const div = document.createElement('div'); div.className = 'ro';
+      div.innerHTML = `<b style="color:${seriesColor(fiber().traces.indexOf(tr))}">${seriesLabel(tr)}</b>` +
+        `<table>` +
+        `<tr><td>${t('cursorA')}</td><td><b>${fmtM(state.curA)}</b></td><td>${fmtDb(la)} dB</td></tr>` +
+        `<tr><td>${t('cursorB')}</td><td><b>${fmtM(state.curB)}</b></td><td>${fmtDb(lb)} dB</td></tr>` +
+        `<tr><td>${t('deltaDist')}</td><td><b>${fmtM(Math.abs(dd))}</b></td><td>${t('deltaDb')}: <b>${fmtDb(Math.abs(ddb))} dB</b></td></tr>` +
+        `<tr><td>${t('atten')}</td><td colspan="2"><b>${atten === null ? '—' : atten.toFixed(3) + ' dB/km'}</b></td></tr>` +
+        `</table>`;
+      box.appendChild(div);
+    }
+  }
+
+  // Затухание в произвольном окне [d0,d1], дБ/км: окно режется по точечным
+  // событиям (коннекторы/сварки дают ступеньки уровня, а не распределённое
+  // затухание), в каждом подсегменте — медианные уровни по ~50 м карманам
+  // (устойчиво к пикам отражений) + наименьшие квадраты; итог — средневзвешенное
+  // по длине. Окно обрезается по событию «конец волокна» — шум за ним не входит.
+  function attenuationIn(tr, d0, d1) {
+    if (!tr.samples || !tr.hasGrid) return null;
+    d0 = Math.max(0, d0);
+    // стартовая зона портa (отражение + мертвая зона инжекции) в оценку не входит
+    const portEv = tr.events.find(e => e.kind === 'point' && e.status === 72);
+    if (portEv && d0 <= portEv.dist + 1) d0 = portEv.dist + 200;
+    let hi = traceMaxDist(tr);
+    const endEv = tr.events.find(e => e.kind === 'point' && e.status === 132);
+    if (endEv) hi = Math.min(hi, endEv.dist);
+    d1 = Math.min(d1, hi);
+    if (d1 - d0 < 100) return null; // окно слишком короткое — оценка не имеет смысла
+
+    const cuts = tr.events
+      .filter(e => e.kind === 'point' && e.status !== 72 && e.dist > d0 + 10 && e.dist < d1 - 10)
+      .map(e => e.dist).sort((a, b) => a - b);
+    const bounds = [d0];
+    for (const c of cuts) if (c - bounds[bounds.length - 1] >= 100) bounds.push(c);
+    bounds.push(d1);
+
+    let sum = 0, len = 0;
+    for (let k = 0; k + 1 < bounds.length; k++) {
+      const s = slopeFit(tr, bounds[k], bounds[k + 1]);
+      if (s !== null && Number.isFinite(s)) { const w = bounds[k + 1] - bounds[k]; sum += s * w; len += w; }
+    }
+    return len >= 100 ? sum / len : null;
+  }
+
+  // Наклон уровня по расстоянию в [d0,d1] (дБ/км): медианы по карманам + НМК.
+  function slopeFit(tr, d0, d1) {
+    const span = d1 - d0;
+    if (span < 100) return null;
+    const i0 = Math.max(0, traceDistInv(tr, d0));
+    const i1 = Math.min(tr.samples.length - 1, traceDistInv(tr, d1));
+    const nBins = Math.max(4, Math.min(60, Math.floor(span / 50)));
+    let n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (let b = 0; b < nBins; b++) {
+      const a = i0 + Math.round((i1 - i0) * b / nBins);
+      const c = i0 + Math.round((i1 - i0) * (b + 1) / nBins);
+      if (c - a < 3) continue;
+      const vals = [];
+      for (let i = a; i < c; i++) vals.push(traceLevelDb(tr, i));
+      vals.sort((x, y) => x - y);
+      const med = vals[vals.length >> 1];
+      const km = traceDistAt(tr, (a + c - 1) / 2) / 1000; // центр кармана
+      n++; sx += km; sy += med; sxx += km * km; sxy += km * med;
+    }
+    if (n < 4) return null;
+    const den = n * sxx - sx * sx;
+    if (Math.abs(den) < 1e-12) return null;
+    return -(n * sxy - sx * sy) / den; // дБ/км: уровень падает с расстоянием
+  }
+
+  // Длина подопытного волокна: от QC-коннектора (Status 0) до конца (Status 132).
+  function fiberSpanLen(tr) {
+    if (!tr.events) return null;
+    const pts = tr.events.filter(e => e.kind === 'point');
+    const qc = pts.find(e => e.status === 0);
+    const end = pts.find(e => e.status === 132);
+    return qc && end && end.dist > qc.dist ? end.dist - qc.dist : null;
+  }
+
+  // ---------------- мета-карточки ----------------
+  function renderMeta() {
+    const box = $('meta'); box.innerHTML = '';
+    const f = fiber(); if (!f) return;
+    // perm — карточки, которые сворачиваются кнопкой «Метадані»
+    const perm = document.createElement('div'); perm.id = 'permCards';
+    box.appendChild(perm);
+    const add = (title, lines, into) => {
+      const c = document.createElement('div'); c.className = 'card';
+      c.innerHTML = `<h3>${title}</h3><div>${lines.join('<br>')}</div>`;
+      (into || box).appendChild(c);
+    };
+    const head = [`${t('fiber')}: <b>${f.identifier || f.name}</b>`];
+    if (f.code !== null) head.push(`${t('fiberCode')}: ${f.code}`);
+    const first = f.traces[0];
+    if (first && first.meta.date) head.push(`${t('date')}: ${first.meta.date}`);
+    if (first && first.meta.module) head.push(`${t('module')}: ${first.meta.module} (${t('serial')}: ${first.meta.serial})`);
+    add('TrcViewer', head, perm);
+    for (const tr of f.traces) {
+      if (!tr.samples) continue;
+      add(seriesLabel(tr), [
+        `${t('samples')}: ${tr.samples.length}`,
+        `${t('spanLength')}: ${tr.meta.spansLength !== null ? tr.meta.spansLength.toFixed(1) : fmtM(traceMaxDist(tr))}`,
+        `${t('spanLoss')}: ${fmtDb(tr.meta.spansLoss)}`,
+        `${t('attenKm')}: ${(() => { const a = traceAttenuation(tr); return a === null ? '—' : a.toFixed(3); })()}`,
+        `${t('injection')}: ${fmtDb(tr.meta.injection)}`,
+        `${t('orl')}: ${fmtDb(tr.meta.orl)}`,
+        `${t('noise')}: ${fmtDb(tr.meta.rmsNoise)}`,
+      ], perm);
+    }
+    // карточка измерений волокна (участок QC-коннектор → конец): длина и
+    // затухание дБ/км на каждой длине волны
+    const meas = f.traces.filter(tr => tr.samples)
+      .map(tr => ({ tr, len: fiberSpanLen(tr), att: traceAttenuation(tr) }));
+    if (meas.some(m => m.len !== null || m.att !== null)) {
+      const lines = [];
+      for (const m of meas) lines.push(`${seriesLabel(m.tr)} ${t('fiberLen')}: ${m.len === null ? '—' : fmtM(m.len)}`);
+      for (const m of meas) lines.push(`${seriesLabel(m.tr)} ${t('attenShort')}: ${m.att === null ? '—' : m.att.toFixed(3)} ${t('dBkm')}`);
+      add(t('fiberMeas'), lines);
+    }
+  }
+
+  // ---------------- контролы серий ----------------
+  function renderSeriesControls() {
+    const grp = $('seriesGrp'); grp.innerHTML = '';
+    const f = fiber(); if (!f) return;
+    f.traces.forEach((tr, i) => {
+      const lab = document.createElement('label');
+      lab.innerHTML = `<input type="checkbox" data-tr="${i}" ${state.visible[i] ? 'checked' : ''}>` +
+        `<span class="swatch" style="background:${seriesColor(i)}"></span>${seriesLabel(tr)}`;
+      lab.querySelector('input').addEventListener('change', e => {
+        state.visible[i] = e.target.checked; yDirty = true; render();
+      });
+      grp.appendChild(lab);
+    });
+  }
+
+  function fullRange() {
+    const f = fiber(); if (!f) return;
+    let hi = 0;
+    for (const tr of f.traces) if (tr.samples && tr.hasGrid) hi = Math.max(hi, traceMaxDist(tr));
+    for (const tr of f.traces) for (const ev of tr.events) hi = Math.max(hi, ev.dist);
+    state.x0 = 0; state.x1 = Math.max(hi * 1.02, 10);
+    state.yFixed = null; yDirty = true;
+  }
+
+  function setView(x0, x1) { state.x0 = Math.max(0, x0); state.x1 = Math.max(state.x0 + 1, x1); state.yFixed = null; yDirty = true; render(); }
+
+  // ---------------- загрузка файла ----------------
+  let statusInfo = null; // последний статус — перерисовывается при смене языка
+  function renderStatus() {
+    const status = $('status');
+    if (!statusInfo) { status.textContent = ''; return; }
+    if (statusInfo.kind === 'ok') {
+      status.className = '';
+      status.textContent = `${t('loaded')}: ${statusInfo.name} (${statusInfo.time} s ${t('parseTime')})`;
+    } else {
+      status.className = 'err';
+      status.textContent = `${t('err')}: ${statusInfo.message} — ${t('notTrc')}`;
+    }
+  }
+  function loadFile(file) {
+    const t0 = performance.now();
+    file.arrayBuffer().then(buf => {
+      const fibers = parseTrcFile(buf);
+      state.fibers = fibers; state.fiberIdx = 0;
+      applyFiber();
+      state.fileName = file.name; $('fileName').textContent = file.name;
+      statusInfo = { kind: 'ok', name: file.name, time: ((performance.now() - t0) / 1000).toFixed(2) };
+      renderStatus();
+    }).catch(err => {
+      statusInfo = { kind: 'err', message: err.message };
+      renderStatus();
+    });
+  }
+
+  function applyFiber() {
+    const f = fiber(); if (!f) return;
+    state.visible = f.traces.map(() => true);
+    state.curA = null; state.curB = null; state.yFixed = null;
+    fullRange();
+    const sel = $('fiberSel');
+    if (state.fibers.length > 1) {
+      sel.hidden = false; sel.innerHTML = '';
+      state.fibers.forEach((fb, i) => {
+        const o = document.createElement('option');
+        o.value = i; o.textContent = `${t('fiber')} ${i + 1}: ${fb.identifier || fb.name}`;
+        sel.appendChild(o);
+      });
+      sel.value = state.fiberIdx;
+    } else sel.hidden = true;
+    renderMeta(); renderSeriesControls(); render();
+  }
+
+  $('fileSel').addEventListener('change', e => { if (e.target.files.length) loadFile(e.target.files[0]); });
+  $('fiberSel').addEventListener('change', e => { state.fiberIdx = +e.target.value; applyFiber(); });
+
+  // drag&drop по всей странице
+  const dz = $('dropzone');
+  let dragDepth = 0;
+  window.addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; dz.style.display = 'flex'; dz.textContent = t('dropHint'); });
+  window.addEventListener('dragover', e => e.preventDefault());
+  window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; dz.style.display = 'none'; } });
+  window.addEventListener('drop', e => {
+    e.preventDefault(); dragDepth = 0; dz.style.display = 'none';
+    if (e.dataTransfer.files.length) loadFile(e.dataTransfer.files[0]);
+  });
+
+  // ---------------- мышь на графике ----------------
+  // Прилипание курсора к событию EventTable в пределах ~12 px — чтобы
+  // «длина участка» между курсорами совпадала с карточкой «Волокно (измерения)».
+  function snapEventDist(x) {
+    const f = fiber(); if (!f) return null;
+    let best = null, bestDx = 12;
+    for (const tr of f.traces) for (const ev of tr.events) {
+      if (ev.kind !== 'point') continue;
+      const dx = Math.abs(distToX(ev.dist) - x);
+      if (dx <= bestDx) { bestDx = dx; best = ev.dist; }
+    }
+    return best;
+  }
+
+  let drag = null; // {mode:'pan'|'box'|'cursorA'|'cursorB', ...}
+
+  // Firefox сообщает колесо в «строках» (deltaMode=1), Chrome — в пикселях;
+  // нормализуем к пикселям и ограничиваем: один щелчок колеса даёт одинаковый
+  // шаг зума в любом браузере и на любой мыши.
+  const wheelDelta = (d, mode) => Math.max(-240, Math.min(240,
+    mode === 1 ? d * 33 : mode === 2 ? d * 400 : d));
+
+  canvas.addEventListener('wheel', e => {
+    if (!visibleTraces().length) return;
+    e.preventDefault();
+    const dx = wheelDelta(e.deltaX, e.deltaMode), dy = wheelDelta(e.deltaY, e.deltaMode);
+    // горизонтальное колесо (Firefox/тачпад) — панорамирование без смены Y
+    if (Math.abs(dx) > Math.abs(dy)) {
+      const span = state.x1 - state.x0;
+      let d0 = state.x0 + dx * span / plotW();
+      d0 = Math.max(0, d0);
+      state.x0 = d0; state.x1 = d0 + span;
+      render(); // Y не меняется при панораме
+      return;
+    }
+    const anchor = xToDist(Math.max(PAD.l, Math.min(W - PAD.r, e.offsetX)));
+    const f = Math.exp(dy * 0.0015);
+    let x0 = anchor + (state.x0 - anchor) * f, x1 = anchor + (state.x1 - anchor) * f;
+    if (x1 - x0 < 1) { const c = (x0 + x1) / 2; x0 = c - 0.5; x1 = c + 0.5; }
+    if (x0 < 0) { x1 -= x0; x0 = 0; }
+    state.x0 = x0; state.x1 = x1; // зум меняет только горизонталь; Y — по явным действиям
+    render();
+  }, { passive: false });
+
+  canvas.addEventListener('mousedown', e => {
+    const x = e.offsetX;
+    const near = pos => pos !== null && Math.abs(distToX(pos) - x) <= 6;
+    if (near(state.curA)) drag = { mode: 'cursorA' };
+    else if (near(state.curB)) drag = { mode: 'cursorB' };
+    else if (e.shiftKey) drag = { mode: 'box', x0px: x, x1px: x };
+    else {
+      drag = { mode: 'pan', x0px: x, dist0: state.x0, dist1: state.x1 };
+    }
+  });
+
+  window.addEventListener('mousemove', e => {
+    if (!drag) { hover(e); return; }
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    if (drag.mode === 'pan') {
+      const span = drag.dist1 - drag.dist0;
+      let d0 = drag.dist0 - (x - drag.x0px) / plotW() * span;
+      d0 = Math.max(0, d0);
+      state.x0 = d0; state.x1 = d0 + span; render(); // Y не трогаем
+    } else if (drag.mode === 'box') {
+      drag.x1px = x; render(); drawBox(drag);
+    } else {
+      const px = Math.max(PAD.l, Math.min(W - PAD.r, x));
+      const pos = Math.max(0, xToDist(px));
+      const snapped = snapEventDist(px);
+      if (drag.mode === 'cursorA') state.curA = snapped !== null ? snapped : pos;
+      else state.curB = snapped !== null ? snapped : pos;
+      render();
+    }
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (drag && drag.mode === 'box') {
+      const a = xToDist(Math.min(drag.x0px, drag.x1px)), b = xToDist(Math.max(drag.x0px, drag.x1px));
+      if (Math.abs(drag.x1px - drag.x0px) > 8) setView(a, b); else render();
+    }
+    drag = null;
+  });
+
+  function drawBox(d) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(26,111,176,.10)'; ctx.strokeStyle = '#1a6fb0'; ctx.setLineDash([4, 3]);
+    ctx.fillRect(d.x0px, PAD.t, d.x1px - d.x0px, plotH());
+    ctx.strokeRect(d.x0px, PAD.t, d.x1px - d.x0px, plotH());
+    ctx.restore();
+  }
+
+  canvas.addEventListener('dblclick', () => { fullRange(); render(); });
+
+  // ---------------- tooltip + координаты под курсором ----------------
+  const tip = $('tooltip');
+  function hover(e) {
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    const f = fiber();
+    if (!f || x < PAD.l || x > W - PAD.r || y < PAD.t || y > H - PAD.b) { tip.style.display = 'none'; $('hoverInfo').textContent = ''; return; }
+    const d = xToDist(x);
+    const vt = visibleTraces();
+    $('hoverInfo').textContent = fmtM(d) +
+      (vt.length ? ' · ' + vt.map(tr => `${seriesLabel(tr)}: ${levelAt(tr, d).toFixed(3)} dB`).join(' · ') : '');
+    // ближайшее событие
+    let best = null, bestDx = 8;
+    for (const trc of f.traces) for (const ev of trc.events) {
+      const dx = Math.abs(distToX(ev.dist) - x);
+      if (dx <= bestDx) { bestDx = dx; best = ev; }
+    }
+    if (best) {
+      const lines = [`${evLabel(best)} — ${fmtM(best.dist)}`];
+      if (best.loss !== null) lines.push(`${t('loss')}: ${best.loss.toFixed(3)}`);
+      if (best.reflectance !== null) lines.push(`${t('refl')}: ${best.reflectance.toFixed(2)}`);
+      if (best.length !== null && best.kind === 'section') lines.push(`${t('len')}: ${best.length.toFixed(1)}`);
+      tip.textContent = lines.join('\n');
+      tip.style.display = 'block';
+      tip.style.left = Math.min(W - 260, x + 12) + 'px';
+      tip.style.top = Math.max(4, y - 10) + 'px';
+    } else tip.style.display = 'none';
+  }
+  canvas.addEventListener('mouseleave', () => { tip.style.display = 'none'; $('hoverInfo').textContent = ''; });
+
+  // ---------------- кнопки ----------------
+  const placeCursor = key => { const c = (state.x0 + state.x1) / 2; const s = snapEventDist(distToX(c)); state[key] = s !== null ? s : c; render(); };
+  $('btnA').addEventListener('click', () => placeCursor('curA'));
+  $('btnB').addEventListener('click', () => placeCursor('curB'));
+  $('btnClear').addEventListener('click', () => { state.curA = null; state.curB = null; render(); });
+  $('pFull').addEventListener('click', () => { fullRange(); render(); });
+  $('pStart').addEventListener('click', () => setView(0, 30));
+  $('pQC').addEventListener('click', () => setView(0, 1200));
+  $('pFiber').addEventListener('click', () => {
+    const f = fiber(); if (!f) return;
+    let qc = Infinity, end = 0;
+    for (const tr of f.traces) for (const ev of tr.events) {
+      if (ev.kind === 'point' && ev.status === 0) qc = Math.min(qc, ev.dist);
+      if (ev.kind === 'point' && ev.status === 132) end = Math.max(end, ev.dist);
+    }
+    if (!Number.isFinite(qc)) qc = 1200;          // нет QC-события — типовая граница буфера
+    if (end === 0) for (const tr of f.traces) if (tr.samples && tr.hasGrid) end = Math.max(end, traceMaxDist(tr));
+    const pad = Math.max((end - qc) * 0.02, 10);
+    setView(qc - pad, end + pad);
+    // курсоры — точно на границы волокна (QC-коннектор и конец) первой трассы,
+    // чтобы «Длина участка» в оверлее графика совпадала с карточкой «Волокно (измерения)».
+    // Позиции QC/конец на 1310 и 1550 отличаются на единицы метров — курсоры общие.
+    const own = f.traces.map(tr => {
+      const q = tr.events.find(e => e.kind === 'point' && e.status === 0);
+      const n = tr.events.find(e => e.kind === 'point' && e.status === 132);
+      return q && n && n.dist > q.dist ? { q: q.dist, n: n.dist } : null;
+    }).find(Boolean);
+    if (own) { state.curA = own.q; state.curB = own.n; render(); }
+  });
+  $('pEnd').addEventListener('click', () => {
+    const f = fiber(); if (!f) return;
+    let end = 0;
+    for (const tr of f.traces) for (const ev of tr.events) if (ev.status === 132) end = Math.max(end, ev.dist);
+    if (end === 0) for (const tr of f.traces) if (tr.samples && tr.hasGrid) end = Math.max(end, traceMaxDist(tr));
+    setView(end - 50, end + 50);
+  });
+  $('cbEvents').addEventListener('change', e => { state.showEvents = e.target.checked; render(); });
+  $('cbYAuto').addEventListener('change', e => {
+    state.yAuto = e.target.checked;
+    if (!state.yAuto && !state.yFixed) state.yFixed = [yMin, yMax];
+    if (state.yAuto) { state.yFixed = null; yDirty = true; }
+    render();
+  });
+  $('btnFitY').addEventListener('click', () => { // ручная подгонка Y под текущее окно
+    $('cbYAuto').checked = true; state.yAuto = true; state.yFixed = null; yDirty = true; render();
+  });
+
+  // ---------------- печать / сохранение в PDF (всегда один лист) ----------------
+  // window.print() открывает штатный диалог браузера («Сохранить как PDF»).
+  // Макет печати целиком относительный (см. @media print): блоки во всю ширину
+  // страницы, график забирает остаток высоты, body ограничен высотой страницы —
+  // поэтому он заполняет лист любого размера и не может выйти за его границы
+  // (фиксированные миллиметры давать нельзя: ширина области печати в CSS-пикселах
+  // у разных браузеров/драйверов разная). Канвас на время печати перерисовывается
+  // с фиксированной «печатной» геометрией PRINT_W × PRINT_W/PRINT_ASPECT — значит
+  // физический размер шрифтов и отступов в PDF не зависит от формы окна.
+  // PRINT_ASPECT выбран так, чтобы совпадать с реальным блоком графика на листе:
+  // канвас заполняет его без полей и без заметного растяжения подписей.
+  // Разрешение 3x (~300 dpi).
+  // Печать передаёт текущее состояние главного окна: окно обзора, курсоры,
+  // видимые длины волн и свёрнутость метаданных (для свёрнутых график получает
+  // больше высоты, поэтому печатная геометрия берётся с PRINT_ASPECT_COLLAPSED).
+  function printBoost(on) {
+    if (on) {
+      if (printGeom) return;
+      // фиксированная «печатная» ширина (не зависит от размера окна):
+      // физический размер шрифтов и отступов в PDF всегда одинаковый
+      const collapsed = $('cardsrow').classList.contains('collapsed');
+      const w = PRINT_W;
+      printGeom = { w, h: Math.round(w / (collapsed ? PRINT_ASPECT_COLLAPSED : PRINT_ASPECT)) };
+      printScale = 3;
+      resize();
+    } else {
+      if (!printGeom) return;
+      printGeom = null;
+      printScale = 1;
+      resize();
+    }
+  }
+  window.addEventListener('beforeprint', () => printBoost(true));
+  window.addEventListener('afterprint', () => printBoost(false));
+  try { // Firefox не всегда даёт beforeprint — подстраховываемся matchMedia('print')
+    const mq = window.matchMedia('print');
+    (mq.addEventListener || mq.addListener).call(mq, e => printBoost(e.matches));
+  } catch (_) { }
+  $('btnPrint').addEventListener('click', () => {
+    printBoost(true);
+    try { window.print(); } finally { printBoost(false); }
+  });
+
+  // ---------------- сворачиваемые карточки метаданных ----------------
+  // TrcViewer + карточки длин волн сворачиваются влево (по умолчанию свёрнуты);
+  // карточка «Волокно (вимірювання)» — всегда на экране. Выбор запоминается.
+  const LS_META = 'trcviewer.metaOpen';
+  function setMetaOpen(open) {
+    $('cardsrow').classList.toggle('collapsed', !open);
+    $('btnMetaToggle').setAttribute('aria-expanded', open ? 'true' : 'false');
+    $('metaChev').textContent = open ? '‹' : '›'; // стрелка направления сворачивания
+    try { localStorage.setItem(LS_META, open ? '1' : '0'); } catch (_) { }
+  }
+  $('btnMetaToggle').addEventListener('click', () =>
+    setMetaOpen($('cardsrow').classList.contains('collapsed')));
+  let metaOpen0 = false;
+  try { metaOpen0 = localStorage.getItem(LS_META) === '1'; } catch (_) { }
+  setMetaOpen(metaOpen0);
+
+  // ---------------- язык ----------------
+  function applyLang() {
+    document.documentElement.lang = lang;
+    $('langRu').classList.toggle('on', lang === 'ru');
+    $('langEn').classList.toggle('on', lang === 'en');
+    $('langUa').classList.toggle('on', lang === 'uk');
+    document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.dataset.i18n); });
+    if (fiber()) { renderMeta(); renderSeriesControls(); renderReadout(visibleTraces()); }
+    renderStatus();
+    render();
+  }
+  $('langRu').addEventListener('click', () => { lang = 'ru'; applyLang(); });
+  $('langEn').addEventListener('click', () => { lang = 'en'; applyLang(); });
+  $('langUa').addEventListener('click', () => { lang = 'uk'; applyLang(); });
+
+  // инициализация
+  applyLang();
+  resize();
+})();
+</script>
+</body>
+</html>
