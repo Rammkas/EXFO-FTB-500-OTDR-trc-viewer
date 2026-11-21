@@ -18,6 +18,13 @@ several fibers, pick one in the header dropdown.
 
 Tested in Firefox and Chromium-based browsers (Chrome, Edge).
 
+![TrcViewer plot: fiber under test between cursors A and B, both wavelengths](docs/screenshot.png)
+
+*Preset «Волокно (після буфера)» / “fiber after the buffer”: cursors A/B snapped to the QC
+connector (1 km) and the fiber end (8 km); the overlay shows the 7 km segment length and
+0.322 / 0.184 dB/km for 1310 / 1550 nm. Made with a **synthetic** demo reflectogram — no real
+link data.*
+
 ## Features
 
 - **Both wavelengths** (1310 / 1550 nm) as checkboxes, drawn from the raw
@@ -90,6 +97,7 @@ Tested in Firefox and Chromium-based browsers (Chrome, Edge).
 index.html          UI + plot (canvas), zoom/pan, cursors A/B, events, printing
 otdr-parser.js      .trc parser (no DOM access), used by index.html and the tests
 tests/selftest.html parser self-tests — open in a browser
+docs/screenshot.png screenshot for this README
 FORMAT.md           full reverse-engineered .trc format description
 README.ru.md        полное описание на русском
 CHANGELOG.md        release history
