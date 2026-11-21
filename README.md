@@ -18,12 +18,11 @@ several fibers, pick one in the header dropdown.
 
 Tested in Firefox and Chromium-based browsers (Chrome, Edge).
 
-![TrcViewer plot: fiber under test between cursors A and B, both wavelengths](docs/screenshot.png)
+![TrcViewer: full range view with event markers, both wavelengths](docs/screenshot.png)
 
-*Preset «Волокно (після буфера)» / “fiber after the buffer”: cursors A/B snapped to the QC
-connector (1 km) and the fiber end (8 km); the overlay shows the 7 km segment length and
-0.322 / 0.184 dB/km for 1310 / 1550 nm. Made with a **synthetic** demo reflectogram — no real
-link data.*
+*Full range view (English UI): event markers **port 0 m**, **injection event 1.011 km**,
+**fiber end 8.347 km**, noise beyond the fiber end, the fiber measurement card (length and
+dB/km per wavelength) and the overlay with the current range, segment length and attenuation.*
 
 ## Features
 
